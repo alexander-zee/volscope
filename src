@@ -1,0 +1,313 @@
+# streamlit_volatility_dashboard_yahoo.py
+# Run: streamlit run streamlit_volatility_dashboard_yahoo.py
+# Requirements:
+#   pip install streamlit yfinance pandas numpy matplotlib
+
+from __future__ import annotations
+
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+import streamlit as st
+import matplotlib.pyplot as plt
+
+ANNUALIZATION = 252
+
+
+# --- Helpers ---------------------------------------------------------------
+
+def safe_int(s: str, default: int) -> int:
+    try:
+        return int(s)
+    except Exception:
+        return default
+
+
+def compute_realized_vol(close: pd.Series, window: int) -> pd.Series:
+    """Realized volatility from daily log returns, annualized."""
+    logret = np.log(close).diff()
+    hv = logret.rolling(window=window).std() * np.sqrt(ANNUALIZATION)
+    return hv
+
+
+def percentile_rank(series: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling percentile rank of the last observation inside each rolling window.
+    Returns values in [0,1].
+    """
+    def _last_rank(x):
+        s = pd.Series(x)
+        return s.rank(pct=True).iloc[-1]
+
+    return series.rolling(window=window, min_periods=window).apply(_last_rank, raw=False)
+
+
+def regime_from_percentile(p: float) -> tuple[str, str]:
+    """Map percentile to (label, color)."""
+    if np.isnan(p):
+        return ("N/A", "gray")
+    if p >= 0.80:
+        return ("HIGH VOL", "red")
+    if p >= 0.60:
+        return ("ABOVE AVG", "orange")
+    if p >= 0.40:
+        return ("NORMAL", "black")
+    if p >= 0.20:
+        return ("BELOW AVG", "blue")
+    return ("LOW VOL", "green")
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    st.session_state.logs.append(f"[{ts}] {msg}")
+
+
+# --- Data / Compute --------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def fetch_yahoo(symbol: str, period: str) -> pd.DataFrame:
+    df = yf.download(
+        symbol,
+        period=period,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    # yfinance can return MultiIndex columns; flatten if needed
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    if df is None or df.empty:
+        raise RuntimeError("No rows returned. Try another symbol/period.")
+
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+
+    if "Close" not in df.columns:
+        raise RuntimeError("Yahoo data missing 'Close' column.")
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def run_analysis(df: pd.DataFrame, w_short: int, w_long: int) -> tuple[pd.DataFrame, int]:
+    close = df["Close"].dropna()
+
+    hv_s = compute_realized_vol(close, w_short)
+    hv_l = compute_realized_vol(close, w_long)
+
+    lookback = min(252, max(w_long, 60))
+    pct = percentile_rank(hv_s, window=lookback)
+
+    out = pd.DataFrame({
+        "Close": close,
+        "HV_short": hv_s,
+        "HV_long": hv_l,
+        "HV_pct": pct,
+    }).dropna()
+
+    if len(out) < max(w_long, 80):
+        raise RuntimeError("Not enough datapoints after rolling calculations. Increase period (e.g., 5y).")
+
+    return out, lookback
+
+
+# --- Plotting --------------------------------------------------------------
+
+def plot_price(df: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(6.2, 3.8))
+    ax.plot(df.index, df["Close"])
+    ax.set_title("Price (Adj)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate(rotation=45)
+    st.pyplot(fig, use_container_width=True)
+
+
+def plot_vol(df: pd.DataFrame, w_short: int, w_long: int):
+    fig, ax = plt.subplots(figsize=(6.2, 3.8))
+    ax.plot(df.index, df["HV_short"], label=f"HV {w_short}d")
+    ax.plot(df.index, df["HV_long"], label=f"HV {w_long}d")
+
+    p25 = df["HV_short"].quantile(0.25)
+    p75 = df["HV_short"].quantile(0.75)
+    mean = df["HV_short"].mean()
+
+    ax.axhline(p75, linestyle="--", alpha=0.7, label="HV short 75%")
+    ax.axhline(p25, linestyle="--", alpha=0.7, label="HV short 25%")
+    ax.axhline(mean, linestyle="--", alpha=0.7, label="HV short mean")
+
+    ax.set_title("Realized Volatility (annualized)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Vol")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.autofmt_xdate(rotation=45)
+    st.pyplot(fig, use_container_width=True)
+
+
+def plot_scatter_forward(df: pd.DataFrame):
+    # HV(short) today vs average HV(short) in next 20 trading days
+    future_hv = df["HV_short"].rolling(window=20, min_periods=20).mean().shift(-20)
+    tmp = pd.DataFrame({"hv_now": df["HV_short"], "hv_fwd": future_hv}).dropna()
+
+    fig, ax = plt.subplots(figsize=(6.2, 3.8))
+    ax.scatter(tmp["hv_now"], tmp["hv_fwd"], alpha=0.6, s=18)
+
+    x = tmp["hv_now"].values
+    y = tmp["hv_fwd"].values
+    if len(x) >= 10:
+        b1, b0 = np.polyfit(x, y, 1)
+        xline = np.linspace(x.min(), x.max(), 100)
+        yline = b1 * xline + b0
+        ax.plot(xline, yline, linewidth=2, label=f"fit: y={b1:.2f}x+{b0:.2f}")
+        ax.legend(fontsize=8)
+
+    ax.set_title("HV(short) vs Forward 20d HV(short)")
+    ax.set_xlabel("HV(short) now")
+    ax.set_ylabel("Forward 20d avg HV(short)")
+    ax.grid(True, alpha=0.3)
+    st.pyplot(fig, use_container_width=True)
+
+
+# --- Streamlit App ---------------------------------------------------------
+
+def init_state():
+    if "data" not in st.session_state:
+        st.session_state.data = None
+    if "analysis_df" not in st.session_state:
+        st.session_state.analysis_df = None
+    if "logs" not in st.session_state:
+        st.session_state.logs = []
+
+
+def main():
+    st.set_page_config(page_title="Volatility Dashboard (Yahoo Finance)", layout="wide")
+    init_state()
+
+    st.title("Volatility Dashboard (Yahoo Finance)")
+
+    # Controls
+    with st.container():
+        c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.6, 1.0, 1.0])
+        symbol = c1.text_input("Symbol", value="SPY").strip().upper()
+        period = c2.text_input("Period (e.g., 1y, 2y, 5y, max)", value="2y").strip().lower()
+        w_short = c3.number_input("HV short window", min_value=5, max_value=400, value=20, step=1)
+        w_long = c4.number_input("HV long window", min_value=5, max_value=800, value=60, step=1)
+
+        fetch_clicked = c5.button("Fetch Data", use_container_width=True)
+
+    # Validate window logic (same as your Tk app)
+    if int(w_short) >= int(w_long):
+        st.warning("Short window should be smaller than long window (e.g., 20 and 60).")
+
+    # Buttons row (Analyze + utility)
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
+    analyze_clicked = b1.button("Analyze", use_container_width=True)
+    clear_logs_clicked = b2.button("Clear log", use_container_width=True)
+    clear_cache_clicked = b3.button("Clear cache", use_container_width=True)
+
+    if clear_logs_clicked:
+        st.session_state.logs = []
+
+    if clear_cache_clicked:
+        st.cache_data.clear()
+        log("Cache cleared.")
+
+    # Fetch action
+    if fetch_clicked:
+        if not symbol:
+            st.error("Please enter a symbol (e.g., SPY).")
+        else:
+            try:
+                log(f"Fetching Yahoo Finance data for {symbol} (period={period})...")
+                with st.spinner(f"Fetching {symbol}..."):
+                    df = fetch_yahoo(symbol, period)
+                st.session_state.data = df
+                st.session_state.analysis_df = None
+                log(f"Received {len(df)} rows. Range: {df.index.min().date()} → {df.index.max().date()}")
+            except Exception as e:
+                st.session_state.data = None
+                st.session_state.analysis_df = None
+                log(f"Fetch failed: {e}")
+                st.error(f"Fetch failed: {e}")
+
+    # Analyze action
+    if analyze_clicked:
+        if st.session_state.data is None or st.session_state.data.empty:
+            st.error("No data loaded. Click Fetch Data first.")
+        else:
+            if int(w_short) < 5 or int(w_long) < 5:
+                st.error("HV windows should be at least 5.")
+            elif int(w_short) >= int(w_long):
+                st.error("Short window should be smaller than long window (e.g., 20 and 60).")
+            else:
+                try:
+                    log(f"Computing realized volatility (short={int(w_short)}, long={int(w_long)})...")
+                    with st.spinner("Analyzing..."):
+                        out, lookback = run_analysis(st.session_state.data, int(w_short), int(w_long))
+                    st.session_state.analysis_df = out
+                    hv_s_now = float(out["HV_short"].iloc[-1])
+                    hv_l_now = float(out["HV_long"].iloc[-1])
+                    pct_now = float(out["HV_pct"].iloc[-1])
+                    log(
+                        f"Done. Latest HV(short)={hv_s_now:.4f}, HV(long)={hv_l_now:.4f}, "
+                        f"percentile={pct_now:.3f} (lookback={lookback})"
+                    )
+                except Exception as e:
+                    st.session_state.analysis_df = None
+                    log(f"Analyze failed: {e}")
+                    st.error(f"Analyze failed: {e}")
+
+    # Snapshot
+    st.subheader("Current Volatility Snapshot")
+    snap = st.session_state.analysis_df
+
+    s1, s2, s3, s4 = st.columns([1.2, 1.2, 1.2, 1.5])
+    if snap is not None and not snap.empty:
+        hv_s_now = float(snap["HV_short"].iloc[-1])
+        hv_l_now = float(snap["HV_long"].iloc[-1])
+        pct_now = float(snap["HV_pct"].iloc[-1])
+        regime, color = regime_from_percentile(pct_now)
+
+        s1.metric("Current HV (short)", f"{hv_s_now*100:.2f}%")
+        s2.metric("Current HV (long)", f"{hv_l_now*100:.2f}%")
+        s3.metric("Percentile (short)", f"{pct_now:.1%}")
+        s4.markdown(
+            f"**Regime:** <span style='color:{color}; font-weight:700;'>{regime}</span>",
+            unsafe_allow_html=True
+        )
+    else:
+        s1.metric("Current HV (short)", "N/A")
+        s2.metric("Current HV (long)", "N/A")
+        s3.metric("Percentile (short)", "N/A")
+        s4.markdown("**Regime:** N/A")
+
+    # Results plots
+    st.subheader("Results")
+    if snap is not None and not snap.empty:
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            plot_price(snap)
+        with p2:
+            plot_vol(snap, int(w_short), int(w_long))
+        with p3:
+            plot_scatter_forward(snap)
+
+        with st.expander("Show analysis table"):
+            st.dataframe(snap.tail(300), use_container_width=True)
+    else:
+        st.info("Fetch data, then Analyze to see charts.")
+
+    # Status log
+    st.subheader("Status")
+    st.text_area("Log", value="\n".join(st.session_state.logs), height=180)
+
+
+if __name__ == "__main__":
+    main()
